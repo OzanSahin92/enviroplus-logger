@@ -8,6 +8,10 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.12"
 aws-cdk-lib = "2.122.0"
+awsiotsdk = "^1.24.0"
+
+[tool.poetry.scripts]
+enviroplus-agent = "enviroplus_logger.cli:main"
 
 [tool.poetry.group.dev.dependencies]
 jupyterlab = "^4.0.9"
