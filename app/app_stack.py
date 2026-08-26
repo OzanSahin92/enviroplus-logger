@@ -1,163 +1,119 @@
 from aws_cdk import (
-    Stack,
-    aws_iam as iam,
-    aws_s3 as s3,
-    aws_lambda as _lambda,
-    aws_timestream as timestream,
+    CfnOutput,
     Duration,
-    RemovalPolicy,
-    SecretValue,
-    aws_lambda_event_sources as lambda_event_sources,
+    Stack,
+)
+from aws_cdk import (
+    aws_iam as iam,
+)
+from aws_cdk import (
+    aws_iot as iot,
+)
+from aws_cdk import (
+    aws_sqs as sqs,
+)
+from aws_cdk import (
+    aws_timestream as timestream,
 )
 from constructs import Construct
-import os
-from dotenv import load_dotenv
-import enviro_lambda.lambda_function as lf
-
-load_dotenv()
 
 
 class EnviroLoggerStack(Stack):
+    """Serverless ingestion path for Enviro+ telemetry.
+
+    Device identities and X.509 certificates are deliberately provisioned outside
+    this stack so private keys are generated and retained on the device.
+    """
+
+    TOPIC_FILTER = "enviroplus/+/telemetry"
+
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # IAM
-        # IAM User with AdministratorAccess and IAMUserChangePassword
-        admin_user = iam.User(
+        database = timestream.CfnDatabase(
+            self, "TelemetryDatabase", database_name="enviroplus-telemetry"
+        )
+        table = timestream.CfnTable(
             self,
-            "mrerzincan",
-            password=SecretValue.plain_text(os.getenv("IAM_ADMIN_USER_PW")),
-            password_reset_required=True,  # Users with AdministratorAccess should have password reset required
+            "TelemetryTable",
+            database_name=database.database_name,
+            table_name="readings",
+            retention_properties=timestream.CfnTable.RetentionPropertiesProperty(
+                memory_store_retention_period_in_hours="24",
+                magnetic_store_retention_period_in_days="365",
+            ),
         )
-        admin_user.add_managed_policy(
-            iam.ManagedPolicy.from_aws_managed_policy_name("AdministratorAccess")
-        )
-        admin_user.add_managed_policy(
-            iam.ManagedPolicy.from_aws_managed_policy_name("IAMUserChangePassword")
-        )
+        table.add_dependency(database)
 
-        # IAM Group for S3, Timestream, Lambda access
-        enviro_group = iam.Group(self, "enviro")
-
-        # IAM Policies for S3, Timestream, Lambda
-        s3_policy = iam.Policy(
+        ingestion_failures = sqs.Queue(
             self,
-            "S3Policy",
-            statements=[iam.PolicyStatement(actions=["s3:*"], resources=["*"])],
+            "IngestionFailures",
+            encryption=sqs.QueueEncryption.SQS_MANAGED,
+            retention_period=Duration.days(14),
+            enforce_ssl=True,
         )
-        object_lambda_policy = iam.Policy(
+
+        rule_role = iam.Role(
             self,
-            "ObjectLambdaPolicy",
-            statements=[
-                iam.PolicyStatement(actions=["s3-object-lambda:*"], resources=["*"])
-            ],
+            "IoTRuleRole",
+            assumed_by=iam.ServicePrincipal("iot.amazonaws.com"),
+            description="Least-privilege role used by the Enviro+ IoT topic rule",
         )
-        timestream_policy = iam.Policy(
-            self,
-            "TimestreamPolicy",
-            statements=[iam.PolicyStatement(actions=["timestream:*"], resources=["*"])],
-        )
-        lambda_policy = iam.Policy(
-            self,
-            "LambdaPolicy",
-            statements=[iam.PolicyStatement(actions=["lambda:*"], resources=["*"])],
-        )
-
-        # Attach policies to group
-        enviro_group.add_managed_policy(s3_policy)
-        enviro_group.add_managed_policy(object_lambda_policy)
-        enviro_group.add_managed_policy(timestream_policy)
-        enviro_group.add_managed_policy(lambda_policy)
-
-        # IAM Users added to the IAM Group
-        iam_user1 = iam.User(
-            self,
-            "mrerzincan_enviro",
-            password=SecretValue.plain_text(os.getenv("IAM_USER_MRERZINCAN_ENVIRO_PW")),
-        )
-        iam_user2 = iam.User(
-            self,
-            "hakan_enviro",
-            password=SecretValue.plain_text(os.getenv("IAM_USER_HAKAN_ENVIRO_PW")),
-        )
-
-        enviro_group.add_user(iam_user1)
-        enviro_group.add_user(iam_user2)
-
-        # Define an S3 bucket
-        my_enviro_bucket = s3.Bucket(
-            self,
-            "myenvirobucket",
-            versioned=False,  # Disable versioning (optional)
-            removal_policy=RemovalPolicy.DESTROY,  # This will delete the bucket when the stack is deleted (use with caution)
-        )
-
-        # S3 bucket for error logs
-        timestream_error_logs_bucket = s3.Bucket(
-            self, "mytimestreamerrorlogs", removal_policy=RemovalPolicy.DESTROY
-        )
-
-        # Timestream database
-        timestream_database = timestream.CfnDatabase(
-            self, "MyEnviroTimestreamDatabase", database_name="enviroDB-CDK"
-        )
-
-        # Timestream table
-        timestream_table = timestream.CfnTable(
-            self,
-            "MyEnviroTimestreamTable",
-            database_name=timestream_database.database_name,
-            table_name="enviroTable-CDK",
-        )
-
-        # Add the dependency
-        timestream_table.add_depends_on(timestream_database)
-
-        # IAM role for Lambda to write to Timestream
-        timestream_write_role = iam.Role(
-            self,
-            "TimestreamWriteRole",
-            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
-        )
-        timestream_write_role.add_to_policy(
+        rule_role.add_to_policy(
             iam.PolicyStatement(
-                actions=["timestream:WriteRecords"],
-                resources=[timestream_table.attr_arn],
+                actions=["timestream:WriteRecords"], resources=[table.attr_arn]
             )
         )
-
-        # Lambda function
-        lambda_function = _lambda.Function(
-            self,
-            "enviroLambda",
-            runtime=_lambda.Runtime.PYTHON_3_12,
-            handler="enviro_lambda.lambda_function.lambda_handler",  # Adjust the import path
-            code=_lambda.Code.from_asset(
-                "enviro_lambda"
-            ),  # Path to your Lambda function code
-            environment={
-                "TIMESTREAM_DATABASE_NAME": "enviroDB-CDK",
-                "ERROR_LOGS_BUCKET_NAME": timestream_error_logs_bucket.bucket_name,
-            },
-            timeout=Duration.seconds(30),
-        )
-
-        # Grant Lambda permissions to read from data bucket
-        my_enviro_bucket.grant_read(lambda_function)
-
-        # Grant Lambda permission to assume the IAM role
-        lambda_function.role.add_to_policy(
+        rule_role.add_to_policy(
             iam.PolicyStatement(
-                actions=["sts:AssumeRole"], resources=[timestream_write_role.role_arn]
+                actions=["timestream:DescribeEndpoints"], resources=["*"]
             )
         )
+        ingestion_failures.grant_send_messages(rule_role)
 
-        # Grant S3 bucket permission for error logs
-        timestream_error_logs_bucket.grant_write(lambda_function)
-
-        # Configure Lambda function to trigger on S3 object creation events
-        lambda_function.add_event_source(
-            lambda_event_sources.S3EventSource(
-                my_enviro_bucket, events=[s3.EventType.OBJECT_CREATED]
-            )
+        topic_rule = iot.CfnTopicRule(
+            self,
+            "TelemetryRule",
+            topic_rule_payload=iot.CfnTopicRule.TopicRulePayloadProperty(
+                aws_iot_sql_version="2015-10-08",
+                description="Validate and route versioned Enviro+ readings to Timestream",
+                sql=(
+                    "SELECT schema_version, temperature_c, pressure_hpa, "
+                    "humidity_pct, illuminance_lux, proximity, oxidising_ohm, "
+                    "reducing_ohm, nh3_ohm, sampled_at_ms "
+                    f"FROM '{self.TOPIC_FILTER}' WHERE schema_version = 1"
+                ),
+                actions=[
+                    iot.CfnTopicRule.ActionProperty(
+                        timestream=iot.CfnTopicRule.TimestreamActionProperty(
+                            database_name=database.database_name,
+                            table_name=table.table_name,
+                            role_arn=rule_role.role_arn,
+                            dimensions=[
+                                iot.CfnTopicRule.TimestreamDimensionProperty(
+                                    name="device_id", value="${topic(2)}"
+                                ),
+                                iot.CfnTopicRule.TimestreamDimensionProperty(
+                                    name="schema_version", value="${schema_version}"
+                                ),
+                            ],
+                            timestamp=iot.CfnTopicRule.TimestreamTimestampProperty(
+                                value="${sampled_at_ms}", unit="MILLISECONDS"
+                            ),
+                        )
+                    )
+                ],
+                error_action=iot.CfnTopicRule.ActionProperty(
+                    sqs=iot.CfnTopicRule.SqsActionProperty(
+                        queue_url=ingestion_failures.queue_url,
+                        role_arn=rule_role.role_arn,
+                        use_base64=False,
+                    )
+                ),
+                rule_disabled=False,
+            ),
         )
+        topic_rule.node.add_dependency(table, rule_role, ingestion_failures)
+
+        CfnOutput(self, "TelemetryTopic", value="enviroplus/<device-id>/telemetry")
+        CfnOutput(self, "FailureQueueUrl", value=ingestion_failures.queue_url)
