@@ -12,7 +12,7 @@ users or credentials provisioned by the stack.
 
 ```mermaid
 flowchart LR
-    A[Enviro+ / Raspberry Pi] -->|MQTT over mutual TLS| B[AWS IoT Core]
+A[Enviro+ / Raspberry Pi] -->|durable spool + MQTT QoS 1 over mTLS| B[AWS IoT Core]
     B -->|validated topic rule| C[Amazon Timestream]
     B -->|error action| D[SQS failure queue]
     C --> E[Grafana]
@@ -42,6 +42,31 @@ timestamp.
 
 `TelemetryReading` validates ranges and rejects non-finite values before a
 message reaches the publisher.
+
+## Device agent
+
+The edge agent uses the AWS IoT Device SDK v2 and an individual X.509 identity.
+It first commits every reading to a local SQLite WAL, publishes it with MQTT
+QoS 1, and deletes it only after the SDK acknowledges delivery. Interrupted
+connections therefore produce at-least-once rather than silent data loss.
+Failures are retried with bounded exponential backoff.
+
+The CLI currently generates realistic, deterministic samples so the complete
+device path can be developed without Enviro+ hardware:
+
+```bash
+poetry run enviroplus-agent \
+  --endpoint <account-prefix>-ats.iot.<region>.amazonaws.com \
+  --device-id lab-one \
+  --certificate /secure/device.pem.crt \
+  --private-key /secure/private.pem.key \
+  --root-ca /secure/AmazonRootCA1.pem \
+  --spool ./telemetry.db \
+  --count 10 --interval 5
+```
+
+Certificate material is supplied at runtime and must never be committed. The
+included hardened systemd unit shows the intended production file layout.
 
 ## Security decisions
 
@@ -75,7 +100,7 @@ poetry run cdk deploy --profile <profile>
 
 ## Current scope and roadmap
 
-Implemented in v0.2:
+Implemented in v0.3:
 
 - versioned and validated telemetry model
 - IoT Core topic rule
@@ -83,12 +108,13 @@ Implemented in v0.2:
 - encrypted SQS failure queue
 - least-privilege service role
 - CDK assertion tests and continuous integration
+- mutual-TLS publisher using the AWS IoT Device SDK v2
+- SQLite write-ahead spool with QoS 1 delivery and exponential backoff
+- deterministic simulated-device mode for hardware-independent development
 
 Next milestones:
 
-- mutual-TLS device publisher using the AWS IoT Device SDK
-- durable on-device spool with retry and exponential backoff
-- simulated-device mode for development without Enviro+ hardware
+- Enviro+ hardware sensor adapter
 - CloudWatch operational metrics and alarms
 - reproducible Grafana dashboard
 - automated integration test in a disposable AWS environment
