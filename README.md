@@ -1,61 +1,101 @@
-# TODOs
-* Remove old aws infrastructure (except timestream database)
-* refactor cdk stack and deploy again
-* update aws credentials on raspbery pi with cdk iam user credentials
-* update aws s3 bucket info on raspberry pi code
-* connect grafana to aws cdk timestream database
-* migrate old timestream db to new and remove old
-* add unittests for stack
+# Enviro+ Edge Telemetry Platform
 
+A production-oriented reference implementation for collecting environmental
+measurements on an embedded Linux device and routing versioned MQTT telemetry
+through AWS IoT Core into Amazon Timestream.
 
-# Welcome to your CDK Python project!
+The project is being modernised from an earlier S3/Lambda prototype. Version
+0.2 focuses on a secure, observable ingestion foundation with no long-lived IAM
+users or credentials provisioned by the stack.
 
-This is a blank project for CDK development with Python.
+## Architecture
 
-The `cdk.json` file tells the CDK Toolkit how to execute your app.
-
-This project is set up like a standard Python project.  The initialization
-process also creates a virtualenv within this project, stored under the `.venv`
-directory.  To create the virtualenv it assumes that there is a `python3`
-(or `python` for Windows) executable in your path with access to the `venv`
-package. If for any reason the automatic creation of the virtualenv fails,
-you can create the virtualenv manually.
-
-To manually create a virtualenv on MacOS and Linux:
-
-```
-$ python3 -m venv .venv
+```mermaid
+flowchart LR
+    A[Enviro+ / Raspberry Pi] -->|MQTT over mutual TLS| B[AWS IoT Core]
+    B -->|validated topic rule| C[Amazon Timestream]
+    B -->|error action| D[SQS failure queue]
+    C --> E[Grafana]
 ```
 
-After the init process completes and the virtualenv is created, you can use the following
-step to activate your virtualenv.
+Messages are published to `enviroplus/<device-id>/telemetry`. The device ID is
+derived from the MQTT topic rather than trusted from the payload. The IoT rule
+accepts schema version 1 and writes measurements using the device sampling
+timestamp.
 
+## Telemetry schema v1
+
+```json
+{
+  "schema_version": 1,
+  "temperature_c": 21.5,
+  "pressure_hpa": 1012.4,
+  "humidity_pct": 48.0,
+  "illuminance_lux": 120.0,
+  "proximity": 0.0,
+  "oxidising_ohm": 100.0,
+  "reducing_ohm": 200.0,
+  "nh3_ohm": 300.0,
+  "sampled_at_ms": 1725000000000
+}
 ```
-$ poetry shell
+
+`TelemetryReading` validates ranges and rejects non-finite values before a
+message reaches the publisher.
+
+## Security decisions
+
+- Devices authenticate to AWS IoT Core with individual X.509 certificates.
+- Private keys are generated and retained on the device, not in CloudFormation.
+- The CDK stack creates no IAM users or passwords.
+- The IoT rule role can write only to the telemetry table and failure queue.
+- SQS is encrypted and rejects non-TLS access.
+- Failed rule actions are retained for 14 days for investigation and replay.
+
+Device certificate provisioning is intentionally separate from this stack. A
+future provisioning workflow will attach a per-device policy restricted to the
+device's own MQTT topic.
+
+## Development
+
+Requirements: Python 3.12, Poetry, and the AWS CDK CLI.
+
+```bash
+poetry install
+poetry run pytest
+poetry run ruff check .
+poetry run python app.py
 ```
 
-Once the virtualenv is activated, you can install the required dependencies.
+Deploy to an already bootstrapped AWS account:
 
-```
-$ poetry install
-```
-
-At this point you can now synthesize the CloudFormation template for this code.
-
-```
-$ cdk synth
+```bash
+poetry run cdk deploy --profile <profile>
 ```
 
-To add additional dependencies, for example other CDK libraries, just add
-them to your `pyproject.toml` file and rerun the `poetry install`
-command.
+## Current scope and roadmap
 
-## Useful commands
+Implemented in v0.2:
 
- * `cdk ls`          list all stacks in the app
- * `cdk synth`       emits the synthesized CloudFormation template
- * `cdk deploy`      deploy this stack to your default AWS account/region
- * `cdk diff`        compare deployed stack with current state
- * `cdk docs`        open CDK documentation
+- versioned and validated telemetry model
+- IoT Core topic rule
+- Timestream database and retention policy
+- encrypted SQS failure queue
+- least-privilege service role
+- CDK assertion tests and continuous integration
 
-Enjoy!
+Next milestones:
+
+- mutual-TLS device publisher using the AWS IoT Device SDK
+- durable on-device spool with retry and exponential backoff
+- simulated-device mode for development without Enviro+ hardware
+- CloudWatch operational metrics and alarms
+- reproducible Grafana dashboard
+- automated integration test in a disposable AWS environment
+
+## Service availability note
+
+Amazon Timestream for LiveAnalytics is no longer available to new customers
+after 20 June 2025. Existing customers can continue using it. A future storage
+adapter will provide a deployable alternative for new AWS accounts while
+preserving the telemetry contract.
